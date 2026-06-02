@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+"""Interactive cmux color configurator — no manual config editing needed."""
+
+import json
+import os
+import re
+import subprocess
+import sys
+
+CMUX_BIN = "/Applications/cmux.app/Contents/Resources/bin/cmux"
+CMUX_JSON = os.path.expanduser("~/.config/cmux/cmux.json")
+GHOSTTY_CONFIG = os.path.expanduser(
+    "~/Library/Application Support/com.cmuxterm.app/config.ghostty"
+)
+
+# ── JSONC helpers ────────────────────────────────────────────────────────────
+
+def _strip_jsonc(text):
+    """Strip // line-comments from JSONC so json.loads can parse it."""
+    in_string = False
+    result = []
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if in_string:
+            if c == "\\" and i + 1 < len(text):
+                result.append(c)
+                result.append(text[i + 1])
+                i += 2
+                continue
+            if c == '"':
+                in_string = False
+            result.append(c)
+        else:
+            if c == '"':
+                in_string = True
+                result.append(c)
+            elif c == "/" and i + 1 < len(text) and text[i + 1] == "/":
+                # Skip to end of line
+                while i < len(text) and text[i] != "\n":
+                    i += 1
+                continue
+            else:
+                result.append(c)
+        i += 1
+    return "".join(result)
+
+def load_cmux_json():
+    try:
+        raw = open(CMUX_JSON).read()
+        stripped = _strip_jsonc(raw)
+        # Remove trailing commas before } or ] (common in JSONC)
+        stripped = re.sub(r",(\s*[}\]])", r"\1", stripped)
+        return json.loads(stripped)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def save_cmux_json(data):
+    os.makedirs(os.path.dirname(CMUX_JSON), exist_ok=True)
+    # Always write the schema header first
+    out = {
+        "$schema": "https://raw.githubusercontent.com/manaflow-ai/cmux/main/web/data/cmux.schema.json",
+        "schemaVersion": 1,
+    }
+    # Merge in user settings (skip schema keys from data if present)
+    for k, v in data.items():
+        if k not in ("$schema", "schemaVersion"):
+            out[k] = v
+    with open(CMUX_JSON, "w") as f:
+        json.dump(out, f, indent=2)
+        f.write("\n")
+
+# ── Ghostty config helpers ───────────────────────────────────────────────────
+
+def load_ghostty():
+    """Return {key: value} dict from Ghostty config (key = value format)."""
+    cfg = {}
+    try:
+        for line in open(GHOSTTY_CONFIG):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, _, v = line.partition("=")
+                cfg[k.strip()] = v.strip()
+    except FileNotFoundError:
+        pass
+    return cfg
+
+def save_ghostty(cfg):
+    os.makedirs(os.path.dirname(GHOSTTY_CONFIG), exist_ok=True)
+    lines = []
+    try:
+        existing = open(GHOSTTY_CONFIG).readlines()
+    except FileNotFoundError:
+        existing = []
+
+    written_keys = set()
+    for line in existing:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            k = stripped.split("=", 1)[0].strip()
+            if k in cfg:
+                lines.append(f"{k} = {cfg[k]}\n")
+                written_keys.add(k)
+                continue
+        lines.append(line)
+
+    # Append any new keys not already in the file
+    for k, v in cfg.items():
+        if k not in written_keys:
+            lines.append(f"{k} = {v}\n")
+
+    with open(GHOSTTY_CONFIG, "w") as f:
+        f.writelines(lines)
+
+# ── cmux CLI helpers ─────────────────────────────────────────────────────────
+
+def reload():
+    print("  Reloading cmux…")
+    r = subprocess.run([CMUX_BIN, "reload-config"], capture_output=True, text=True)
+    if r.returncode == 0:
+        print("  ✓ Reloaded.")
+    else:
+        print(f"  ✗ Reload failed: {r.stderr.strip()}")
+
+def current_themes():
+    r = subprocess.run([CMUX_BIN, "themes", "list"], capture_output=True, text=True)
+    light = dark = "inherit"
+    for line in r.stdout.splitlines():
+        if line.startswith("Current light:"):
+            light = line.split(":", 1)[1].strip()
+        elif line.startswith("Current dark:"):
+            dark = line.split(":", 1)[1].strip()
+    return light, dark
+
+# ── UI helpers ───────────────────────────────────────────────────────────────
+
+def dim(s):
+    return f"\033[2m{s}\033[0m"
+
+def bold(s):
+    return f"\033[1m{s}\033[0m"
+
+def green(s):
+    return f"\033[32m{s}\033[0m"
+
+def prompt(label, current=None, hint=None):
+    suffix = ""
+    if current:
+        suffix += f"  {dim(f'current: {current}')}"
+    if hint:
+        suffix += f"  {dim(hint)}"
+    print(f"  {label}{suffix}")
+    return input("  → ").strip()
+
+def confirm(msg):
+    return input(f"  {msg} [y/N] ").strip().lower() == "y"
+
+# ── Sections ─────────────────────────────────────────────────────────────────
+
+def section_theme():
+    """Open cmux's built-in interactive theme picker (live preview)."""
+    print()
+    print(bold("  Terminal Theme"))
+    light, dark = current_themes()
+    print(f"  Current light: {dim(light)}")
+    print(f"  Current dark:  {dim(dark)}")
+    print()
+    print("  Opening cmux's live theme picker…")
+    print("  (Navigate with arrow keys, Enter to apply, Escape to cancel)")
+    print()
+    subprocess.run([CMUX_BIN, "themes"])
+
+def section_sidebar():
+    """Adjust sidebar tint color and opacity."""
+    data = load_cmux_json()
+    sa = data.get("sidebarAppearance", {})
+
+    print()
+    print(bold("  Sidebar Appearance"))
+    print()
+
+    changes = False
+
+    # tintColor
+    val = prompt(
+        "Tint color (hex, e.g. #1a1a2e):",
+        current=sa.get("tintColor", "#000000"),
+        hint="blank to skip",
+    )
+    if val:
+        if not re.match(r"^#[0-9a-fA-F]{3,8}$", val):
+            print("  ✗ Invalid hex color — skipped.")
+        else:
+            sa["tintColor"] = val
+            changes = True
+
+    # tintOpacity
+    val = prompt(
+        "Tint opacity (0.0–1.0):",
+        current=str(sa.get("tintOpacity", 0.18)),
+        hint="blank to skip",
+    )
+    if val:
+        try:
+            f = float(val)
+            if not 0.0 <= f <= 1.0:
+                raise ValueError
+            sa["tintOpacity"] = round(f, 3)
+            changes = True
+        except ValueError:
+            print("  ✗ Invalid value — skipped.")
+
+    # matchTerminalBackground
+    val = prompt(
+        "Match terminal background? (yes/no):",
+        current="yes" if sa.get("matchTerminalBackground") else "no",
+        hint="blank to skip",
+    )
+    if val.lower() in ("yes", "y", "true"):
+        sa["matchTerminalBackground"] = True
+        changes = True
+    elif val.lower() in ("no", "n", "false"):
+        sa["matchTerminalBackground"] = False
+        changes = True
+
+    if changes:
+        data["sidebarAppearance"] = sa
+        save_cmux_json(data)
+        reload()
+    else:
+        print("  No changes.")
+
+def section_workspace_colors():
+    """Edit the named workspace color palette."""
+    data = load_cmux_json()
+    wc = data.get("workspaceColors", {})
+    colors = wc.get("colors", {
+        "Blue": "#1565C0", "Aqua": "#0E6B8C", "Rose": "#880E4F",
+        "Indigo": "#283593", "Green": "#196F3D", "Brown": "#7B3F00",
+        "Olive": "#4A5C18", "Orange": "#A04000", "Charcoal": "#3E4B5E",
+        "Navy": "#1A5276", "Teal": "#006B6B", "Red": "#C0392B",
+        "Purple": "#6A1B9A", "Magenta": "#AD1457", "Crimson": "#922B21",
+        "Amber": "#7D6608",
+    })
+
+    print()
+    print(bold("  Workspace Colors"))
+    print("  These are the named colors assignable to workspaces.")
+    print()
+    for i, (name, hex_val) in enumerate(colors.items(), 1):
+        print(f"  {i:>2}) {name:<10} {dim(hex_val)}")
+    print()
+
+    val = prompt("Enter number to edit (or blank to cancel):").strip()
+    if not val:
+        return
+
+    try:
+        idx = int(val) - 1
+        if not 0 <= idx < len(colors):
+            raise ValueError
+    except ValueError:
+        print("  ✗ Invalid selection.")
+        return
+
+    name, current_hex = list(colors.items())[idx]
+    new_hex = prompt(f"New hex for {name}:", current=current_hex)
+    if not new_hex:
+        print("  No changes.")
+        return
+    if not re.match(r"^#[0-9a-fA-F]{3,8}$", new_hex):
+        print("  ✗ Invalid hex color.")
+        return
+
+    colors[name] = new_hex
+    wc["colors"] = colors
+    data["workspaceColors"] = wc
+    save_cmux_json(data)
+    reload()
+
+def section_terminal_opacity():
+    """Set terminal background opacity (blur effect)."""
+    cfg = load_ghostty()
+
+    print()
+    print(bold("  Terminal Background Opacity"))
+    print("  1.0 = fully opaque, 0.0 = fully transparent")
+    print()
+
+    val = prompt(
+        "Background opacity (0.0–1.0):",
+        current=cfg.get("background-opacity", "1.0"),
+    )
+    if not val:
+        print("  No changes.")
+        return
+    try:
+        f = float(val)
+        if not 0.0 <= f <= 1.0:
+            raise ValueError
+    except ValueError:
+        print("  ✗ Invalid value.")
+        return
+
+    cfg["background-opacity"] = str(round(f, 2))
+    save_ghostty(cfg)
+    reload()
+
+def section_reset():
+    """Remove the cmux theme override."""
+    print()
+    if confirm("Clear the terminal theme override (revert to default)?"):
+        subprocess.run([CMUX_BIN, "themes", "clear"])
+        print(green("  ✓ Theme cleared."))
+
+# ── Main menu ────────────────────────────────────────────────────────────────
+
+MENU = [
+    ("Terminal theme", section_theme),
+    ("Sidebar tint & opacity", section_sidebar),
+    ("Workspace colors", section_workspace_colors),
+    ("Terminal background opacity", section_terminal_opacity),
+    ("Clear theme override", section_reset),
+]
+
+def main():
+    print()
+    print(bold("  cmux Color Settings"))
+    print("  ─────────────────────────────")
+
+    light, dark = current_themes()
+    ghostty = load_ghostty()
+    data = load_cmux_json()
+    sa = data.get("sidebarAppearance", {})
+
+    print(f"  Theme light/dark: {dim(light)} / {dim(dark)}")
+    print(f"  Sidebar tint:     {dim(sa.get('tintColor', '#000000'))}  "
+          f"opacity {dim(str(sa.get('tintOpacity', 0.18)))}")
+    print(f"  BG opacity:       {dim(ghostty.get('background-opacity', '1.0'))}")
+    print()
+
+    for i, (label, _) in enumerate(MENU, 1):
+        print(f"  {i}) {label}")
+    print("  q) Quit")
+    print()
+
+    choice = input("  Choose: ").strip().lower()
+    if choice == "q":
+        return
+    try:
+        idx = int(choice) - 1
+        if 0 <= idx < len(MENU):
+            MENU[idx][1]()
+        else:
+            print("  ✗ Invalid choice.")
+    except (ValueError, IndexError):
+        print("  ✗ Invalid choice.")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print()
